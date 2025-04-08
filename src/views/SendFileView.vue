@@ -767,8 +767,8 @@ const getUnit = (value: string = expirationMethod.value) => {
   }
 }
 
-const getPresignedPartURL = (uploadId: string, partNumber: number) => {
-  return `chunk/upload/chunk/${uploadId}/${partNumber}`
+const getPartUrl = (uploadId: string, partNumber: number, fileKey: string) => {
+  return api.post(`chunk/upload/chunk?uploadId=${uploadId}&partNumber=${partNumber}&key=${fileKey}`)
 }
 
 const handleChunkUpload = async (file: File) => {
@@ -790,51 +790,74 @@ const handleChunkUpload = async (file: File) => {
     if (initResponse.detail.existed) {
       return initResponse
     }
-    const uploadId = initResponse.detail.upload_id
-
+    const uploadId = initResponse.detail.uploadId
+    const fileKey = initResponse.detail.key
+    const promises = []
+    let finishIndex = 0
     // 2. 上传切片
     for (let i = 0; i < chunks; i++) {
       const start = i * chunkSize
       const end = Math.min(start + chunkSize, file.size)
       const chunk = file.slice(start, end)
 
-      const presignedPartURL= await  getPresignedPartURL(uploadId, i)
-       console.log('预签名URL:', presignedPartURL)
+      const partUrlRs = await getPartUrl(uploadId, i + 1, fileKey)
+      console.log('预签名URL:', partUrlRs)
       const chunkFormData = new FormData()
-      chunkFormData.append('chunk', new Blob([chunk], { type: file.type })) // 确保以Blob形式添加
-
-      // 使用 application/x-www-form-urlencoded 格式
-      const chunkResponse: any = await api.post(
-        `chunk/upload/chunk/${uploadId}/${i}`,
-        chunkFormData,
-        {
-          headers: {
-            'Content-Type': 'multipart/form-data'
-          },
-          onUploadProgress: (progressEvent: any) => {
-            const percentCompleted = Math.round(
-              ((i * chunkSize + progressEvent.loaded) * 100) / file.size
-            )
-            uploadProgress.value = percentCompleted
-          }
+      const uploadPromise = fetch(partUrlRs.detail.uploadUrl, {
+        method: 'PUT',
+        body: chunk,
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': chunk.size
         }
-      )
+      }).then((res) => {
+        const percentCompleted = Math.round(
+          ((finishIndex * chunkSize + chunk.size) * 100) / file.size
+        )
+        finishIndex++
+        uploadProgress.value = percentCompleted
+        return {
+          part_number: i + 1,
+          etag: res.headers.get('ETag')
+        }
+      })
 
-      if (chunkResponse.code !== 200) {
-        throw new Error(`切片 ${i} 上传失败`)
-      }
+      promises.push(uploadPromise)
+      // 使用 application/x-www-form-urlencoded 格式
+      // const chunkResponse: any = await api.post(
+      //   `chunk/upload/chunk/${uploadId}/${i}`,
+      //   chunkFormData,
+      //   {
+      //     headers: {
+      //       'Content-Type': 'multipart/form-data'
+      //     },
+      //     onUploadProgress: (progressEvent: any) => {
+      //       const percentCompleted = Math.round(
+      //         ((i * chunkSize + progressEvent.loaded) * 100) / file.size
+      //       )
+      //       uploadProgress.value = percentCompleted
+      //     }
+      //   }
+      // )
+      //
+      // if (chunkResponse.code !== 200) {
+      //   throw new Error(`切片 ${i} 上传失败`)
+      // }
     }
 
+    const parts = await Promise.all(promises)
     // 3. 完成上传
-    const completeResponse: any = await api.post(`chunk/upload/complete/${uploadId}`, {
+    const completeResponse: any = await api.post(`chunk/upload/complete`, {
       expire_value: expirationValue.value ? parseInt(expirationValue.value) : 1,
-      expire_style: expirationMethod.value
+      expire_style: expirationMethod.value,
+      upload_id: uploadId,
+      parts,
+      key: fileKey
     })
 
     if (completeResponse.code !== 200) {
       throw new Error('完成上传失败')
     }
-
     return completeResponse
   } catch (error: any) {
     console.error('切片上传失败:', error)
@@ -954,7 +977,7 @@ const handleSubmit = async () => {
         }
       })
     }
-
+    debugger
     if (response && response.code === 200) {
       const retrieveCode = response.detail.code
       const fileName = response.detail.name
